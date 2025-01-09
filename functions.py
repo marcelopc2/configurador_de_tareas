@@ -176,10 +176,11 @@ def get_module_name(assignment_group_id, course_id: str, canvas_base_url: str, h
     url = f"{canvas_base_url}/courses/{course_id}/assignment_groups/{assignment_group_id}"
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
-        return response.json()["name"]
+        return response.json()["name"], response.json()["group_weight"]
     else:
-        print(response.status_code)
-        None
+        return response.status_code
+        
+
 
 def modify_module_name(assignment_group_id, assignment_name, course_id: str, canvas_base_url: str, token: str):
     payload = {

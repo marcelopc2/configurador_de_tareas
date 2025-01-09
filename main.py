@@ -55,7 +55,7 @@ def main():
                 course_name = course_info.get('course_name', 'Nombre no disponible')
                 course_code = course_info.get('course_code', 'Código no disponible')
 
-                st.markdown(f"#### [{course_name} -> {course_code}](https://canvas.uautonoma.cl/courses/{course_id})")
+                st.markdown(f"#### [{course_name} -> {course_code}](https://canvas.uautonoma.cl/courses/{course_id}/assignments)")
 
                 # Obtener tareas
                 assignments = get_assignments(course_id, BASE_URL, headers)
@@ -85,7 +85,10 @@ def main():
                         submission_types = a.get("submission_types", [])
                         allowed_attempts = a.get("allowed_attempts", -1)
                         teamwork = a.get('group_category_id')
-                        module_name = get_module_name(a.get("assignment_group_id"), course_id, BASE_URL, headers)
+                        module_name, module_weight = get_module_name(a.get("assignment_group_id"), course_id, BASE_URL, headers)
+                        group_categories = get_group_categories(course_id, BASE_URL, headers)
+
+                        # ME FALTA AGREGAR LA PONDERACION DEL MODULO
 
                         meets_points = (points == 100)
                         meets_grading = (grading_type == "points")
@@ -93,6 +96,8 @@ def main():
                         meets_attempts = (allowed_attempts == 2)
                         meets_teamwork = (teamwork != None)
                         meets_group = (module_name == name)
+                        meets_group_categories = (any(group.get("name").lower() == "equipo de trabajo" for group in group_categories))
+                        meets_project_groups = (any(group.get("name").lower() == "project groups" for group in group_categories))
 
                         meets_all = (
                             meets_points and
@@ -100,7 +105,9 @@ def main():
                             meets_upload_only and
                             meets_attempts and
                             meets_teamwork and 
-                            meets_group
+                            meets_group and 
+                            meets_group_categories and
+                            not meets_project_groups
                         )
 
                         data_to_display.append({
@@ -113,6 +120,8 @@ def main():
                             "Entrada en Linea": "Carga de Archivos" if 'online_upload' in submission_types else "Mal configurado",
                             "Intentos": allowed_attempts,
                             "Trabajo en Grupo": "Si" if teamwork != None else "No",
+                            "Equipos de Trabajo Creado": "Si" if meets_group_categories else "No",
+                            "Sin Project Group": "Si" if not meets_project_groups else "No",
                             "Cumple los requisitos?": "Sí" if meets_all else "No"
                         })
 
@@ -159,7 +168,7 @@ def main():
                             "Cumple Requisitos?": "Sí" if meets_all else "No"
                         })
 
-                    st.subheader("Trabajo final")
+                    st.markdown("#### Trabajo final")
                     st.dataframe(data_to_display, use_container_width=True)
                 else:
                     st.write("No se encontraron tareas llamadas 'Trabajo final'.")
@@ -211,7 +220,7 @@ def main():
                             break
                     if project_groups_id:
                         try:
-                            delete_group_category(project_groups_id)
+                            delete_group_category(project_groups_id, BASE_URL, headers)
                             st.success(f"Categoría 'Project Groups' eliminada con ID={project_groups_id}.")
                         except requests.exceptions.RequestException as e:
                             st.error(f"❌ Error al eliminar 'Project Groups': {e}")

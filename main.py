@@ -103,20 +103,18 @@ def main():
                             meets_group
                         )
 
-                    data_to_display = [
-                        {
-                            "Rubrica Asociada": "Sí",
-                            "Nombre Rubrica": "Evaluación Final",
-                            "Nombre modulo": "Módulo 1",
-                            "Puntos": 100,
-                            "Tipo Calificación": "Puntos",
-                            "Tipo de Entrega": "En Línea",
-                            "Entrada en Linea": "Carga de Archivos",
-                            "Intentos": 3,
-                            "Trabajo en Grupo": "No",
-                            "Cumple los requisitos?": "Sí",
-                        }
-                    ]
+                        data_to_display.append({
+                            "Rubrica Asociada": has_rubric if has_rubric == "Si" else "No (La rubrica tiene que ser configurada manualmente)",
+                            "Nombre Rubrica": rubric_name if rubric_name else "Sin Rubrica",
+                            "Nombre modulo": module_name if module_name == name else module_name,
+                            "Puntos":  points,
+                            "Tipo Calificación": "Puntos" if grading_type == 'points' else f"Mal configurado ({grading_type})",
+                            "Tipo de Entrega": "En Linea" if 'online_upload' in submission_types else f"Mal configurado ({submission_types})",
+                            "Entrada en Linea": "Carga de Archivos" if 'online_upload' in submission_types else "Mal configurado",
+                            "Intentos": allowed_attempts,
+                            "Trabajo en Grupo": "Si" if teamwork != None else "No",
+                            "Cumple los requisitos?": "Sí" if meets_all else "No"
+                        })
 
                     df = pd.DataFrame(data_to_display)
                     df_transposed = df.T.reset_index()

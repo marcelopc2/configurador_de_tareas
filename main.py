@@ -1,365 +1,440 @@
 import streamlit as st
-import pandas as pd
 import requests
-import random
+import pandas as pd
 from decouple import config
-from functions import get_course_information, get_students, get_assignments, put_assignment, create_group_category, create_group_in_category, distribute_students_min3_max4_special, get_group_categories, delete_group_category, find_group_category, get_rubric_info, modify_module_name, get_module_name
+import logging
 
-BASE_URL = config('BASE_URL', default='https://canvas.uautonoma.cl/api/v1')
-TOKEN = config('TOKEN')
+# Configuración de logging (opcional, puedes ajustar el nivel)
+logging.basicConfig(level=logging.INFO)
 
-headers = {
-    "Authorization": f"Bearer {TOKEN}"
+# Canvas API configuration
+BASE_URL = "https://canvas.uautonoma.cl/api/v1"
+API_TOKEN = config("TOKEN")
+HEADERS = {
+    "Authorization": f"Bearer {API_TOKEN}",
+    "Content-Type": "application/json"   # Por defecto se usa JSON en otras llamadas
 }
 
-def add_student_to_group(group_id: int, student_id: int, is_leader=False):
-    local_headers = {
-        "Authorization": f"Bearer {TOKEN}",
-        "Content-Type": "application/json"
-    }
-    url = f"{BASE_URL}/groups/{group_id}/memberships"
-    data = {
-        "user_id": student_id
+# Crear una sesión de requests para mejorar el rendimiento en múltiples llamadas
+session = requests.Session()
+session.headers.update(HEADERS)
+
+def canvas_request(method, endpoint, payload=None):
+    """
+    Realiza peticiones a la API de Canvas de forma centralizada.
+    
+    :param method: Método HTTP ('get', 'post', 'put', 'delete')
+    :param endpoint: Endpoint de la API (por ejemplo, "/courses/123/assignments")
+    :param payload: Datos a enviar (para POST/PUT)
+    :return: La respuesta en formato JSON o None en caso de error
+    """
+    url = f"{BASE_URL}{endpoint}"
+    try:
+        if method.lower() == "get":
+            response = session.get(url)
+        elif method.lower() == "post":
+            response = session.post(url, json=payload)
+        elif method.lower() == "put":
+            response = session.put(url, json=payload)
+        elif method.lower() == "delete":
+            response = session.delete(url)
+        else:
+            st.error("Método HTTP no soportado")
+            return None
+
+        if not response.ok:
+            st.error(f"Error en la petición a {url} ({response.status_code}): {response.text}")
+            return None
+
+        if response.text:
+            return response.json()
+        else:
+            return None
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"Excepción en la petición a {url}: {e}")
+        return None
+
+def parse_course_ids(input_text):
+    """Limpia y procesa el input para extraer los course IDs."""
+    cleaned = input_text.replace(",", "\n").replace(" ", "\n")
+    return list(filter(None, map(lambda x: x.strip(), cleaned.split("\n"))))
+
+def get_assignments(course_id):
+    """Obtiene todas las tareas de un curso."""
+    return canvas_request("get", f"/courses/{course_id}/assignments") or []
+
+def check_group_categories(course_id):
+    """Obtiene y verifica las categorías de grupo de un curso."""
+    group_categories_response = canvas_request("get", f"/courses/{course_id}/group_categories")
+    if group_categories_response is None:
+        return None
+
+    group_categories = group_categories_response
+
+    trabajo_en_equipo = next((gc for gc in group_categories if gc.get("name") == "Equipo de trabajo"), None)
+    project_groups = next((gc for gc in group_categories if gc.get("name") == "Project Groups"), None)
+
+    return {
+        "Equipo de trabajo": {
+            "exists": trabajo_en_equipo is not None,
+            "id": trabajo_en_equipo["id"] if trabajo_en_equipo else None,
+        },
+        "Project Groups": {
+            "exists": project_groups is not None,
+            "id": project_groups["id"] if project_groups else None,
+        }
     }
 
-    resp = requests.post(url, headers=local_headers, json=data)
-    resp.raise_for_status()
+def get_rubric_details(course_id, assignment):
+    """Obtiene detalles de la rúbrica asociada a una tarea."""
+    if assignment.get("rubric_settings"):
+        rubric_used_for_grading = assignment.get("use_rubric_for_grading")
+        rubric_settings = assignment["rubric_settings"]
+        return {
+            "has_rubric": True,
+            "rubric_points": rubric_settings.get("points_possible"),
+            "rubric_used_for_grading": rubric_used_for_grading
+        }
+    return {"has_rubric": False, "rubric_points": None, "rubric_used_for_grading": False}
 
+def get_module_name(course_id: str, assignment_group_id: str):
+    """Obtiene el nombre, peso e id del módulo (assignment group) de la tarea."""
+    response = canvas_request("get", f"/courses/{course_id}/assignment_groups/{assignment_group_id}")
+    if response and isinstance(response, dict):
+        return {
+            "name": response.get("name"),
+            "weight": response.get("group_weight"),
+            "id": response.get("id")
+        }
+    else:
+        return None
+
+def distribuir_estudiantes(student_ids, min_size, max_size):
+    """
+    Distribuye los estudiantes en equipos cumpliendo con el tamaño mínimo y máximo.
+    Se retorna una lista de listas, donde cada sublista representa un equipo.
+    """
+    teams = [student_ids[i:i + max_size] for i in range(0, len(student_ids), max_size)]
+    
+    # Ajustar equipos si el último tiene menos del tamaño mínimo
+    while len(teams) > 1 and len(teams[-1]) < min_size:
+        deficit = min_size - len(teams[-1])
+        for i in range(deficit):
+            extraido = False
+            # Buscar en los equipos anteriores un estudiante que se pueda mover
+            for j in range(len(teams) - 2, -1, -1):
+                if len(teams[j]) > min_size:
+                    teams[-1].append(teams[j].pop())
+                    extraido = True
+                    break
+            if not extraido:
+                break
+
+    # Garantizar que ningún equipo tenga más de max_size estudiantes
+    for i in range(len(teams)):
+        while len(teams[i]) > max_size:
+            if i + 1 < len(teams):
+                teams[i+1].insert(0, teams[i].pop())
+            else:
+                teams.append([teams[i].pop()])
+
+    return teams
+
+def assign_students_to_teams(course_id, group_category_id, min_size=3, max_size=4):
+    """
+    Crea equipos en Canvas y asigna a cada estudiante a un equipo.
+    Se utiliza la función 'distribuir_estudiantes' para dividir los IDs de los estudiantes.
+    """
+    students_response = canvas_request("get", f"/courses/{course_id}/students")
+    if students_response is None:
+        return
+
+    student_ids = [student["id"] for student in students_response]
+    
+    teams = distribuir_estudiantes(student_ids, min_size, max_size)
+    
+    for idx, team in enumerate(teams):
+        group_name = f"Equipo de trabajo {idx + 1}"
+        create_payload = {"name": group_name}
+        group_response = canvas_request("post", f"/group_categories/{group_category_id}/groups", create_payload)
+        if group_response is None:
+            continue
+
+        group_id = group_response.get("id")
+        st.info(f"Equipo '{group_name}' creado exitosamente con ID {group_id}.")
+        for student_id in team:
+            membership_payload = {"user_id": student_id}
+            membership_response = canvas_request("post", f"/groups/{group_id}/memberships", membership_payload)
+            if membership_response is None:
+                st.error(f"Error al asignar al estudiante {student_id} al equipo '{group_name}'.")
+            else:
+                st.success(f"Estudiante {student_id} asignado al equipo '{group_name}'.")
+
+    st.success("Todos los estudiantes han sido asignados a equipos exitosamente.")
+
+def check_team_assignments(course_id):
+    """
+    Verifica si se han creado equipos y si todos los estudiantes están asignados a un equipo
+    en la categoría 'Equipo de trabajo'.
+    """
+    group_categories = canvas_request("get", f"/courses/{course_id}/group_categories")
+    if not group_categories:
+        return None
+
+    equipo_de_trabajo = next((gc for gc in group_categories if gc.get("name") == "Equipo de trabajo"), None)
+    if not equipo_de_trabajo:
+        return {"teams_created": False, "all_assigned": False}
+    
+    group_category_id = equipo_de_trabajo["id"]
+    groups = canvas_request("get", f"/group_categories/{group_category_id}/groups")
+    if not groups:
+        return {"teams_created": False, "all_assigned": False}
+
+    students_response = canvas_request("get", f"/courses/{course_id}/students")
+    if not students_response:
+        return None
+    
+    student_ids = {student["id"] for student in students_response}
+    assigned_student_ids = set()
+
+    for group in groups:
+        memberships = canvas_request("get", f"/groups/{group['id']}/memberships")
+        if memberships:
+            assigned_student_ids.update(m.get("user_id") for m in memberships)
+
+    all_assigned = student_ids.issubset(assigned_student_ids)
+    return {
+        "teams_created": True,
+        "all_assigned": all_assigned,
+        "unassigned_students": student_ids - assigned_student_ids,
+        "total_students": student_ids
+    }
+
+def analyze_assignment(course_id, assignment):
+    """Analiza la tarea aplicando varios criterios y retorna los detalles."""
+    rubric_details = get_rubric_details(course_id, assignment)
+    group_categories_check = check_group_categories(course_id)
+    module_info = get_module_name(course_id, assignment.get("assignment_group_id"))
+    team_options = check_team_assignments(course_id)
+    
+    third_column = []
+    third_column.append("✅" if rubric_details["has_rubric"] else "🟥")
+    third_column.append("✅" if rubric_details["rubric_points"] == 100 else "🟥")
+    third_column.append("✅" if rubric_details["rubric_used_for_grading"] else "🟥")
+    third_column.append("✅" if assignment.get("submission_types") == ["online_upload"] else "🟥")
+    third_column.append("✅" if assignment.get("allowed_attempts") == 2 else "🟥")
+    third_column.append("✅" if assignment.get("grading_type") == "points" else "🟥")
+    third_column.append("✅" if assignment.get("points_possible") == 100 else "🟥")
+    third_column.append("✅" if module_info['weight'] else "🟥")
+    third_column.append("✅" if module_info["name"] == assignment.get("name") else "🟥")
+    third_column.append("✅" if assignment.get("group_category_id") else "🟥")
+    third_column.append("✅" if group_categories_check["Equipo de trabajo"]["exists"] else "🟥")
+    third_column.append("✅" if not group_categories_check["Project Groups"]["exists"] else "🟥")
+    third_column.append("✅" if team_options != None  and team_options['teams_created'] else "🟥")
+    third_column.append("✅" if team_options != None and team_options['all_assigned'] else "🟥")
+
+    return {
+        "Tiene rubrica": str(rubric_details["has_rubric"]),
+        "Puntos rubrica": str(rubric_details["rubric_points"]),
+        "Usa rubrica para calificar": str(rubric_details["rubric_used_for_grading"]),
+        "Tipo de entrega": str(assignment.get("submission_types")),
+        "Intentos permitidos": str(assignment.get("allowed_attempts")),
+        "Tipo de calificacion": str(assignment.get("grading_type")),
+        "Puntos posibles": str(assignment.get("points_possible")),
+        "Ponderacion": str(f"{module_info['weight']}%" if module_info else "N/A"),
+        "Modulo": str(module_info["name"] if module_info else "N/A"),
+        "Es trabajo en grupo": str(assignment.get("group_category_id") is not None),
+        "Existe Equipo de trabajo": str(group_categories_check["Equipo de trabajo"]["exists"] if group_categories_check else "N/A"),
+        "Existe Project Groups": str(group_categories_check["Project Groups"]["exists"] if group_categories_check else "N/A"),
+        "Equipos creados": str(team_options['teams_created'] if team_options else "N/A"),
+        "Alumnos Asignados": str(team_options['all_assigned'] if team_options else "N/A")
+    }, third_column
+    
+
+def display_details_as_table(details, estado):
+    """Muestra los detalles en forma de tabla usando pandas."""
+    data = {"Requerimiento": list(details.keys()), "Actual": list(details.values()), "Estado":estado}
+    df = pd.DataFrame(data)
+    st.table(df)
+
+def flatten_assignment_payload(nested_payload):
+    """
+    Transforma un payload anidado en uno plano con claves que sigan el formato que espera Canvas.
+    Por ejemplo, transforma:
+       {"assignment": {"grading_type": "points", "submission_types": ["online_upload"], ...}}
+    en:
+       {"assignment[grading_type]": "points",
+        "assignment[submission_types][]": "online_upload",
+        "assignment[submission_type]": "online",
+        ... }
+    """
+    assignment_data = nested_payload.get("assignment", {})
+    flat = {}
+    # Se asume que submission_types es una lista; se envía el primer valor
+    if "submission_types" in assignment_data:
+        flat["assignment[submission_types][]"] = assignment_data["submission_types"][0] if assignment_data["submission_types"] else ""
+    # Se agrega un valor fijo para submission_type
+    flat["assignment[submission_type]"] = "online"
+    # Para el resto de claves
+    for key, value in assignment_data.items():
+        if key == "submission_types":
+            continue  # ya se procesó
+        flat[f"assignment[{key}]"] = value
+    # Si no se especifica, se puede incluir group_assignment como true
+    if "group_assignment" not in assignment_data:
+        flat["assignment[group_assignment]"] = True
+    return flat
+
+def update_assignment(course_id, assignment_id, payload):
+    """Actualiza la configuración de una tarea utilizando payload en formato form-encoded."""
+    endpoint = f"/courses/{course_id}/assignments/{assignment_id}"
+    url = f"{BASE_URL}{endpoint}"
+    flat_payload = flatten_assignment_payload(payload)
+    headers_form = HEADERS.copy()
+    headers_form["Content-Type"] = "application/x-www-form-urlencoded"
+    try:
+        response = session.put(url, data=flat_payload, headers=headers_form)
+        if response.ok:
+            st.success("Opciones del trabajo en grupo corregidos!")
+            return response.json()
+        else:
+            st.error(f"Error al actualizar la tarea: {response.text}")
+            return None
+    except requests.exceptions.RequestException as e:
+        st.error(f"Excepción al actualizar la tarea: {e}")
+        return None
+
+def update_group(course_id: str, assignment_group_id: str, payload):
+    """Actualiza la configuración de un grupo (módulo)."""
+    response = canvas_request("put", f"/courses/{course_id}/assignment_groups/{assignment_group_id}", payload)
+    if response:
+        st.success("Opciones del grupo corregidas!")
+        return True
+    else:
+        return False
+
+def correct_teamwork_assignment(course_id):
+    """
+    Realiza las correcciones necesarias a la tarea 'Trabajo en equipo',
+    actualizando la tarea, el módulo y la categoría de grupo según corresponda.
+    """
+    assignments = get_assignments(course_id)
+    teamwork_assignments = [a for a in assignments if "trabajo en equipo" in a["name"].lower()]
+    if not teamwork_assignments:
+        st.info(f"No hay tareas 'Trabajo en equipo' en el curso {course_id}.")
+        return
+
+    # Se utiliza la primera tarea encontrada para corrección.
+    teamwork_assignment = teamwork_assignments[0]
+    correct_module = get_module_name(course_id, teamwork_assignment.get("assignment_group_id"))
+    correct_group_categories = check_group_categories(course_id)
+    correct_teams = check_team_assignments(course_id)
+    
+    payload_assignment = {}
+    payload_modules = {}
+    payload_group_categories = {}
+    
+    # Correcciones en la tarea
+    if not teamwork_assignment.get("rubric_settings"):
+        st.warning("Sin rúbrica asociada, la corrección debe ser realizada manualmente.")
+    else:
+        if teamwork_assignment["rubric_settings"].get("points_possible") != 100:
+            st.warning(f"Esta rúbrica tiene el puntaje máximo mal configurado ({teamwork_assignment['rubric_settings']['points_possible']}).")
+        if not teamwork_assignment.get("use_rubric_for_grading"):
+            payload_assignment["use_rubric_for_grading"] = True
+    
+    if teamwork_assignment.get("grading_type") != "points":
+        payload_assignment["grading_type"] = "points"
+    
+    if teamwork_assignment.get("submission_types") != ["online_upload"]:
+        payload_assignment["submission_types"] = ["online_upload"]
+    
+    if teamwork_assignment.get("allowed_attempts") != 2:
+        payload_assignment["allowed_attempts"] = 2
+
+    if teamwork_assignment.get("points_possible") != 100:
+        payload_assignment["points_possible"] = 100
+
+    # Correcciones en el módulo (assignment group)
+    if correct_module and correct_module.get("name") != teamwork_assignment.get("name"):
+        payload_modules["name"] = teamwork_assignment.get("name")
+        
+    if correct_module and correct_module.get("weight") != 30:
+        payload_modules["weight"] = 30
+
+    # Correcciones en las categorías de grupo: eliminar 'Project Groups' si existe.
+    if correct_group_categories and correct_group_categories["Project Groups"]["exists"]:
+        response = canvas_request("delete", f"/group_categories/{correct_group_categories['Project Groups']['id']}")
+        if response is not None:
+            st.info("Eliminado 'Project Groups'.")
+        else:
+            st.error("Error al eliminar 'Project Groups'.")
+
+    new_group_category_id = None      
+    if not correct_group_categories or not correct_group_categories["Equipo de trabajo"]["exists"]:
+        payload_group_categories["name"] = "Equipo de trabajo"
+        payload_group_categories["self_signup"] = "disabled"
+        payload_group_categories["auto_leader"] = "random"
+        
+        response = canvas_request("post", f"/courses/{course_id}/group_categories/", payload_group_categories)
+        if response:
+            new_group_category_id = response.get("id")
+            payload_assignment["group_category_id"] = new_group_category_id
+        else:
+            st.warning("No se pudo crear la categoría 'Equipo de trabajo'.")
+    else:
+        payload_assignment["group_category_id"] = correct_group_categories["Equipo de trabajo"]["id"]
+    
+    # Si no se han creado equipos, asignar estudiantes a equipos.
+    if correct_teams is None or not correct_teams.get("teams_created"):
+        group_category_id = new_group_category_id if new_group_category_id else (correct_group_categories["Equipo de trabajo"]["id"] if correct_group_categories else None)
+        if group_category_id:
+            assign_students_to_teams(course_id, group_category_id, 3, 4)
+        else:
+            st.error("No se encontró o creó una categoría de grupo válida.")
+    
+    # Agregar configuración para Turnitin (revisión de similitud)
+    payload_assignment["similarityDetectionTool"] = "Lti::MessageHandler_123"
+    payload_assignment["configuration_tool_type"] = "Lti::MessageHandler"
+    payload_assignment["report_visibility"] = "immediate"
+    
+    # Se prepara el payload final dentro de la clave "assignment"
+    final_assignment_payload = {"assignment": payload_assignment}
+    
+    if payload_assignment:
+        update_assignment(course_id, teamwork_assignment.get("id"), final_assignment_payload)
+    if payload_modules and correct_module:
+        update_group(course_id, correct_module["id"], payload_modules)
 
 def main():
-    st.title("Configurador de tareas en UA Canvas".upper())
+    st.title("REVISADOR y CONFIGURADOR DE TAREAS ⛑️")
+    st.write("Ingresa uno o más IDs de curso:")
 
-    # Campo para ingresar IDs de curso
-    st.subheader("Ingresa los IDs de los cursos a verificar:")
-    cursos_input = st.text_area("Ejemplo: 12345, 67890, 112233")
+    input_ids = st.text_area("Course IDs", height=100)
 
-    # Botón para verificar
-    if st.button("Buscar información"):
-        if not cursos_input.strip():
-            st.warning("No se ingresaron IDs de curso.")
-            return
-
-        cleaned_input = cursos_input.replace("\n", ",").replace("\r", ",")
-        course_ids = cleaned_input.replace(",", " ").split()
-        course_ids = [cid.strip() for cid in course_ids if cid.strip().isdigit()]
-
+    accion = st.radio("Seleccione una acción:", ("Revisar", "Corregir"))
+    
+    if st.button("Ejecutar"):
+        course_ids = parse_course_ids(input_ids)
         if not course_ids:
-            st.warning("No se encontraron IDs válidos.")
-            return
-
-        # Verificar Tareas
-        for course_id in course_ids:
-            try:
-                # Info de curso
-                course_info = get_course_information(course_id, BASE_URL, headers)
-                course_name = course_info.get('course_name', 'Nombre no disponible')
-                course_code = course_info.get('course_code', 'Código no disponible')
-
-                st.markdown(f"#### [{course_name} -> {course_code}](https://canvas.uautonoma.cl/courses/{course_id}/assignments)")
-
-                # Obtener tareas
-                assignments = get_assignments(course_id, BASE_URL, headers)
-                # Filtrar "Trabajo en equipo" y "Trabajo final"
-                teamwork_assignments = [
-                    a for a in assignments
-                    if a.get("name").lower() == "trabajo en equipo"
-                ]
-                final_work_assignments = [
-                    a for a in assignments
-                    if a.get("name").lower() == "trabajo final"
-                ]
-
-                if not teamwork_assignments and not final_work_assignments:
-                    st.write("No se encontraron tareas compatibles.")
-                    continue
-
-                # Mostrar información para "Trabajo en equipo"
-                if teamwork_assignments:
-                    has_rubric, rubric_name = get_rubric_info(teamwork_assignments[0])
-
-                    data_to_display = []
-                    for a in teamwork_assignments:
-                        name = a.get("name")
-                        points = a.get("points_possible")
-                        grading_type = a.get("grading_type")
-                        submission_types = a.get("submission_types", [])
-                        allowed_attempts = a.get("allowed_attempts", -1)
-                        teamwork = a.get('group_category_id')
-                        module_name, module_weight = get_module_name(a.get("assignment_group_id"), course_id, BASE_URL, headers)
-                        group_categories = get_group_categories(course_id, BASE_URL, headers)
-
-                        # ME FALTA AGREGAR LA PONDERACION DEL MODULO
-
-                        meets_points = (points == 100)
-                        meets_grading = (grading_type == "points")
-                        meets_upload_only = (submission_types == ["online_upload"])
-                        meets_attempts = (allowed_attempts == 2)
-                        meets_teamwork = (teamwork != None)
-                        meets_group = (module_name == name)
-                        meets_group_categories = (any(group.get("name").lower() == "equipo de trabajo" for group in group_categories))
-                        meets_project_groups = (any(group.get("name").lower() == "project groups" for group in group_categories))
-
-                        meets_all = (
-                            meets_points and
-                            meets_grading and
-                            meets_upload_only and
-                            meets_attempts and
-                            meets_teamwork and 
-                            meets_group and 
-                            meets_group_categories and
-                            not meets_project_groups
-                        )
-
-                        data_to_display.append({
-                            "Rubrica Asociada": has_rubric if has_rubric == "Si" else "No (La rubrica tiene que ser configurada manualmente)",
-                            "Nombre Rubrica": rubric_name if rubric_name else "Sin Rubrica",
-                            "Nombre modulo": module_name if module_name == name else module_name,
-                            "Puntos":  points,
-                            "Tipo Calificación": "Puntos" if grading_type == 'points' else f"Mal configurado ({grading_type})",
-                            "Tipo de Entrega": "En Linea" if 'online_upload' in submission_types else f"Mal configurado ({submission_types})",
-                            "Entrada en Linea": "Carga de Archivos" if 'online_upload' in submission_types else "Mal configurado",
-                            "Intentos": allowed_attempts,
-                            "Trabajo en Grupo": "Si" if teamwork != None else "No",
-                            "Equipos de Trabajo Creado": "Si" if meets_group_categories else "No",
-                            "Sin Project Group": "Si" if not meets_project_groups else "No",
-                            "Cumple los requisitos?": "Sí" if meets_all else "No"
-                        })
-
-                    df = pd.DataFrame(data_to_display)
-                    df_transposed = df.T.reset_index()
-                    df_transposed.columns = ["Atributo", "Valor"]
-                    st.markdown("#### Trabajo en equipo")
-                    st.dataframe(df_transposed, use_container_width=True)
-                else:
-                    st.write("No se encontraron tareas llamadas 'Trabajo en equipo'.")
-
-                # Mostrar información para "Trabajo final"
-                if final_work_assignments:
-                    has_rubric, rubric_name = get_rubric_info(final_work_assignments[0])
-
-                    data_to_display = []
-                    for a in final_work_assignments:
-                        name = a.get("name")
-                        points = a.get("points_possible")
-                        grading_type = a.get("grading_type")
-                        submission_types = a.get("submission_types", [])
-                        allowed_attempts = a.get("allowed_attempts", -1)
-
-                        meets_points = (points == 100)
-                        meets_grading = (grading_type == "points")
-                        meets_upload_only = (submission_types == ["online_upload"])
-                        meets_attempts = (allowed_attempts == 2)
-
-                        meets_all = (
-                            meets_points and
-                            meets_grading and
-                            meets_upload_only and
-                            meets_attempts
-                        )
-
-                        data_to_display.append({
-                            "Nombre": name,
-                            "Rubrica?": has_rubric,
-                            "Nombre Rubrica": rubric_name,
-                            "Puntos": points,
-                            "Tipo Calificación": grading_type,
-                            "Tipo de Entrega": submission_types,
-                            "Intentos": allowed_attempts,
-                            "Cumple Requisitos?": "Sí" if meets_all else "No"
-                        })
-
-                    st.markdown("#### Trabajo final")
-                    st.dataframe(data_to_display, use_container_width=True)
-                else:
-                    st.write("No se encontraron tareas llamadas 'Trabajo final'.")
-
-            except requests.exceptions.RequestException as e:
-                st.error(f"Ocurrió un error al consultar el curso {course_id}: {e}")
-
-    # Sección para corregir
-    st.divider()
-
-    if st.button("CORREGIR!"):
-        if not cursos_input.strip():
-            st.warning("No se ingresaron IDs de curso.")
-            return
-
-        cleaned_input = cursos_input.replace("\n", ",").replace("\r", ",")
-        course_ids = cleaned_input.replace(",", " ").split()
-        course_ids = [cid.strip() for cid in course_ids if cid.strip().isdigit()]
-
-        if not course_ids:
-            st.warning("No se encontraron IDs de curso válidos.")
-            return
-
-        for course_id in course_ids:
-            try:
-                st.write(f"### Corriendo correcciones en Curso ID: {course_id}")
-                assignments = get_assignments(course_id, BASE_URL, headers)
-                teamwork_assignments = [
-                    a for a in assignments
-                    if a.get("name") == "Trabajo en equipo"
-                ]
-                final_work_assignments = [
-                    a for a in assignments
-                    if a.get("name") == "Trabajo final"
-                ]
-
-                # ===============================
-                # Configuración para "Trabajo en equipo"
-                # ===============================
-                if teamwork_assignments:
-                    # Obtener todas las categorías de grupos
-                    group_categories = get_group_categories(course_id, BASE_URL, headers)
-
-                    # Verificar y eliminar "Project Groups" si existe
-                    project_groups_id = None
-                    for cat in group_categories:
-                        if cat['name'].lower() == "project groups":
-                            project_groups_id = cat['id']
-                            break
-                    if project_groups_id:
-                        try:
-                            delete_group_category(project_groups_id, BASE_URL, headers)
-                            st.success(f"Categoría 'Project Groups' eliminada con ID={project_groups_id}.")
-                        except requests.exceptions.RequestException as e:
-                            st.error(f"❌ Error al eliminar 'Project Groups': {e}")
-
-                    # Verificar si "Equipo de trabajo" ya existe
-                    equipos_trabajo_id = find_group_category(course_id, "Equipo de trabajo", BASE_URL, headers)
-                    if equipos_trabajo_id:
-                        st.warning(f"⚠️ La categoría 'Equipo de trabajo' ya existe con ID={equipos_trabajo_id}. Se omitirá la creación de grupos y la distribución de estudiantes.")
-                        # Continuar con la corrección de tareas sin crear/asignar grupos
-                    else:
-                        # Crear la categoría "Equipo de trabajo"
-                        category_name = "Equipo de trabajo"
-                        category_id = create_group_category(course_id, category_name, BASE_URL, headers)
-
-                        if category_id:
-                            st.success(f"✅ Categoría '{category_name}' creada con ID={category_id}")
-
-                        # Distribuir estudiantes en grupos de 3 a 4
-                        students = get_students(course_id, BASE_URL, headers)
-                        student_ids = [s["id"] for s in students]
-                        random.shuffle(student_ids)
-
-                        groups_list = distribute_students_min3_max4_special(student_ids.copy())
-
-                        # Crear grupos y asignar estudiantes
-                        group_num = 1
-                        for group in groups_list:
-                            group_name = f"{category_name} {group_num}"
-                            try:
-                                group_id = create_group_in_category(category_id, group_name, BASE_URL, headers)
-                                st.write(f"  ✅ Grupo '{group_name}' creado con ID {group_id}")
-
-                                if group:
-                                    # Asignar líder random
-                                    leader_id = random.choice(group)
-                                    add_student_to_group(group_id, leader_id, is_leader=False)
-
-                                    # Asignar al resto como miembros
-                                    for sid in group:
-                                        if sid != leader_id:
-                                            add_student_to_group(group_id, sid, is_leader=False)
-                                    st.write(f"    🔹 Líder asignado: Usuario ID {leader_id}")
-                                    st.write(f"    🔹 Total {len(group)} estudiantes en '{group_name}'")
-                                else:
-                                    st.write(f"    ⚠️ No había estudiantes en este grupo.")
-                            except requests.exceptions.RequestException as e:
-                                st.error(f"❌ Error al crear el grupo '{group_name}' o asignar estudiantes: {e}")
-                                continue
-                            group_num += 1
-
-                # ===============================
-                # Configuración para "Trabajo final"
-                # ===============================
-                if final_work_assignments:
-                    # No se requieren configuraciones de grupo para "Trabajo final"
-
-                    # No hay creación de categorías de grupo ni asignación de estudiantes
-
-                    # Puedes agregar cualquier lógica adicional específica para "Trabajo final" aquí si es necesario
-                    st.info("Configurando tareas de 'Trabajo final' sin configuración de grupos.")
-
-                # Función para actualizar asignaciones
-                def actualizar_asignacion(a, es_grupo=False, category_id=None):
-                    aid = a.get("id")
-                    name = a.get("name")
-                    points = a.get("points_possible")
-                    grading_type = a.get("grading_type")
-                    submission_types = a.get("submission_types", [])
-                    allowed_attempts = a.get("allowed_attempts", -1)
-
-                    update_params = {}
-                    needs_fix = False
-
-                    # (A) 100 puntos
-                    if points != 100:
-                        needs_fix = True
-                        update_params["assignment[points_possible]"] = 100
-                        st.success(f"Puntaje corregido a 100 Puntos para '{name}'.")
-
-                    # (B) Calificación 'points'
-                    if grading_type != "points":
-                        needs_fix = True
-                        update_params["assignment[grading_type]"] = "points"
-                        st.success(f"Tipo de Calificación corregido a 'PUNTOS' para '{name}'.")
-
-                    # (C) 'online_upload'
-                    if submission_types != ["online_upload"]:
-                        needs_fix = True
-                        update_params["assignment[submission_types][]"] = "online_upload"
-                        st.success(f"Habilitado Tipo de Entrega 'En linea' con 'Carga de Archivos' para '{name}'.")
-
-                    # (D) intentos = 2
-                    if allowed_attempts != 2:
-                        needs_fix = True
-                        update_params["assignment[allowed_attempts]"] = 2
-                        st.success(f"Configurado límite de 2 intentos para '{name}'.")
-
-                    # (E) Turnitin hack
-                    needs_fix = True
-                    update_params["assignment[submission_types][]"] = "online_upload"
-                    update_params["assignment[submission_type]"] = "online"
-                    update_params["assignment[similarityDetectionTool]"] = "Lti::MessageHandler_123"
-                    update_params["assignment[configuration_tool_type]"] = "Lti::MessageHandler"
-                    update_params["assignment[report_visibility]"] = "immediate"
-                    st.success(f"Activado Revisión de Plagio Turnitin para '{name}'.")
-
-                    # (F) Tarea en grupo => group_category_id = category_id (solo para "Trabajo en equipo")
-                    if es_grupo and category_id:
-                        needs_fix = True
-                        update_params["assignment[group_category_id]"] = category_id
-                        update_params["assignment[group_assignment]"] = True
-                        st.success(f"Asignada tarea como Trabajo en Grupo para '{name}'.")
-
-                    # Actualizar la tarea si es necesario
-                    if needs_fix:
-                        try:
-                            updated = put_assignment(course_id, aid, update_params, BASE_URL, TOKEN)
-                            st.success(f"✔️ Tarea '{name}' (ID: {aid}) corregida exitosamente.")
-                        except requests.exceptions.RequestException as e:
-                            st.error(f"❌ Error al corregir la tarea '{name}' (ID: {aid}): {e}")
-                    else:
-                        st.write(f"La tarea '{name}' (ID: {aid}) ya cumple con las condiciones.")
-
-                # Actualizar asignaciones de "Trabajo en equipo"
-                if teamwork_assignments:
-                    for a in teamwork_assignments:
-                        actualizar_asignacion(a, es_grupo=True, category_id=equipos_trabajo_id if 'equipos_trabajo_id' in locals() else None)
-
-                # Actualizar asignaciones de "Trabajo final"
-                if final_work_assignments:
-                    for a in final_work_assignments:
-                        actualizar_asignacion(a, es_grupo=False)
-
-                # Notificar al usuario sobre la creación de grupos
-                if teamwork_assignments and not equipos_trabajo_id:
-                    st.success(f"✅ Grupos creados y estudiantes asignados exitosamente para el curso {course_id}.")
-
-            except requests.exceptions.RequestException as e:
-                st.error(f"❌ Error al consultar/corregir el curso {course_id}: {e}")
+            st.warning("No hay IDs de curso válidos.")
+        else:
+            for course_id in course_ids:
+                st.subheader(f"Course ID: {course_id}")
+                if accion == "Revisar":
+                    assignments = get_assignments(course_id)
+                    teamwork_assignments = [a for a in assignments if "trabajo en equipo" in a["name"].lower()]
+                    if not teamwork_assignments:
+                        st.info(f"No hay tareas llamadas 'Trabajo en equipo' en el curso {course_id}.")
+                        continue
+                    for assignment in teamwork_assignments:
+                        st.write(f"### Tarea: {assignment['name']}")
+                        details, third_column = analyze_assignment(course_id, assignment)
+                        display_details_as_table(details, third_column)
+                        st.divider()
+                else:  # acción "Corregir"
+                    correct_teamwork_assignment(course_id)
 
 if __name__ == "__main__":
     main()

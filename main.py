@@ -259,7 +259,7 @@ def analyze_assignment_teamwork(course_id, assignment):
         "Existe Equipo de trabajo": "SI" if third_column[10] == "✅" else "NO",
         "Existe Project Groups": "SI" if third_column[11] == "✅" else "NO",
         "Equipos creados": "SI" if third_column[12] == "✅" else "NO",
-        "Alumnos Asignados": f"SI ({len(team_options['unassigned_students'])} sin asignar)" if third_column[13] == "✅" else "NO",
+        "Alumnos Asignados": f"SI" if third_column[13] == "✅" else f"NO ({len(team_options['unassigned_students'])} sin asignar)",
     }, third_column
     
 def analyze_assignment_forum(course_id, assignment):
@@ -277,7 +277,7 @@ def analyze_assignment_forum(course_id, assignment):
     third_column.append("✅" if assignment.get("points_possible") == 100 else "🟥")
     third_column.append("✅" if int(module_info['weight']) == 20 else "🟥")
     third_column.append("✅" if clean_string(module_info["name"]) == clean_string(assignment.get("name")) else "🟥")
-    third_column.append("✅" if assignment.get("discussion_type") == "threaded" else "🟥")
+    third_column.append("✅" if assignment.get('discussion_topic').get("discussion_type") == "threaded" else "🟥")
 
     return {
         "Tiene rubrica": rubric_details["name"] if third_column[0] == "✅" else "NO TIENE (Requiere configuracion manual)",

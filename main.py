@@ -3,9 +3,12 @@ import requests
 import pandas as pd
 from decouple import config
 import logging
+import unicodedata
+import re
 
 # Configuración de logging (opcional, puedes ajustar el nivel)
 logging.basicConfig(level=logging.INFO)
+st.set_page_config(page_title="REVISADOR y CONFIGURADOR DE TAREAS ⛑️", page_icon="⛑️")
 
 # Canvas API configuration
 BASE_URL = "https://canvas.uautonoma.cl/api/v1"
@@ -18,6 +21,13 @@ HEADERS = {
 # Crear una sesión de requests para mejorar el rendimiento en múltiples llamadas
 session = requests.Session()
 session.headers.update(HEADERS)
+
+def clean_string(input_string: str) -> str:
+    cleaned = input_string.strip().lower()
+    cleaned = unicodedata.normalize('NFD', cleaned)
+    cleaned = re.sub(r'[^\w\s.,!?-]', '', cleaned)
+    cleaned = re.sub(r'[\u0300-\u036f]', '', cleaned)
+    return cleaned
 
 def canvas_request(method, endpoint, payload=None):
     """
@@ -94,7 +104,8 @@ def get_rubric_details(course_id, assignment):
         return {
             "has_rubric": True,
             "rubric_points": rubric_settings.get("points_possible"),
-            "rubric_used_for_grading": rubric_used_for_grading
+            "rubric_used_for_grading": rubric_used_for_grading,
+            "name": rubric_settings.get("title")
         }
     return {"has_rubric": False, "rubric_points": None, "rubric_used_for_grading": False}
 
@@ -211,7 +222,7 @@ def check_team_assignments(course_id):
         "total_students": student_ids
     }
 
-def analyze_assignment(course_id, assignment):
+def analyze_assignment_teamwork(course_id, assignment):
     """Analiza la tarea aplicando varios criterios y retorna los detalles."""
     rubric_details = get_rubric_details(course_id, assignment)
     group_categories_check = check_group_categories(course_id)
@@ -226,8 +237,8 @@ def analyze_assignment(course_id, assignment):
     third_column.append("✅" if assignment.get("allowed_attempts") == 2 else "🟥")
     third_column.append("✅" if assignment.get("grading_type") == "points" else "🟥")
     third_column.append("✅" if assignment.get("points_possible") == 100 else "🟥")
-    third_column.append("✅" if module_info['weight'] else "🟥")
-    third_column.append("✅" if module_info["name"] == assignment.get("name") else "🟥")
+    third_column.append("✅" if int(module_info['weight']) == 30 else "🟥")
+    third_column.append("✅" if clean_string(module_info["name"]) == clean_string(assignment.get("name")) else "🟥")
     third_column.append("✅" if assignment.get("group_category_id") else "🟥")
     third_column.append("✅" if group_categories_check["Equipo de trabajo"]["exists"] else "🟥")
     third_column.append("✅" if not group_categories_check["Project Groups"]["exists"] else "🟥")
@@ -235,23 +246,82 @@ def analyze_assignment(course_id, assignment):
     third_column.append("✅" if team_options != None and team_options['all_assigned'] else "🟥")
 
     return {
-        "Tiene rubrica": str(rubric_details["has_rubric"]),
-        "Puntos rubrica": str(rubric_details["rubric_points"]),
-        "Usa rubrica para calificar": str(rubric_details["rubric_used_for_grading"]),
-        "Tipo de entrega": str(assignment.get("submission_types")),
+        "Tiene rubrica": rubric_details["name"] if third_column[0] == "✅" else "NO TIENE (Requiere configuracion manual)",
+        "Puntos rubrica": str(int(rubric_details["rubric_points"]) if rubric_details["has_rubric"] else "NO TIENE (Requiere configuracion manual)"),
+        "Usa rubrica para calificar": "SI" if third_column[2] == "✅" else "NO",
+        "Tipo de entrega": "En linea" if third_column[3] == "✅" else "Otro",
         "Intentos permitidos": str(assignment.get("allowed_attempts")),
-        "Tipo de calificacion": str(assignment.get("grading_type")),
-        "Puntos posibles": str(assignment.get("points_possible")),
-        "Ponderacion": str(f"{module_info['weight']}%" if module_info else "N/A"),
-        "Modulo": str(module_info["name"] if module_info else "N/A"),
-        "Es trabajo en grupo": str(assignment.get("group_category_id") is not None),
-        "Existe Equipo de trabajo": str(group_categories_check["Equipo de trabajo"]["exists"] if group_categories_check else "N/A"),
-        "Existe Project Groups": str(group_categories_check["Project Groups"]["exists"] if group_categories_check else "N/A"),
-        "Equipos creados": str(team_options['teams_created'] if team_options else "N/A"),
-        "Alumnos Asignados": str(team_options['all_assigned'] if team_options else "N/A")
+        "Tipo de calificacion": "Puntos" if  third_column[5] == "✅" else "Otro",
+        "Puntos posibles": str(int(assignment.get("points_possible"))),
+        "Ponderacion": str(f"{int(module_info['weight'])}%"),
+        "Modulo": str(module_info["name"]),
+        "Es trabajo en grupo": "SI" if third_column[9] == "✅" else "NO",
+        "Existe Equipo de trabajo": "SI" if third_column[10] == "✅" else "NO",
+        "Existe Project Groups": "SI" if third_column[11] == "✅" else "NO",
+        "Equipos creados": "SI" if third_column[12] == "✅" else "NO",
+        "Alumnos Asignados": f"SI ({len(team_options['unassigned_students'])} sin asignar)" if third_column[13] == "✅" else "NO",
     }, third_column
     
+def analyze_assignment_forum(course_id, assignment):
+    """Analiza la tarea aplicando varios criterios y retorna los detalles."""
+    rubric_details = get_rubric_details(course_id, assignment)
+    module_info = get_module_name(course_id, assignment.get("assignment_group_id"))
+    
+    third_column = []
+    third_column.append("✅" if rubric_details["has_rubric"] else "🟥")
+    third_column.append("✅" if rubric_details["rubric_points"] == 100 else "🟥")
+    third_column.append("✅" if rubric_details["rubric_used_for_grading"] else "🟥")
+    third_column.append("✅" if assignment.get("submission_types") == ['discussion_topic'] else "🟥")
+    third_column.append("✅" if assignment.get("allowed_attempts") == -1 else "🟥")
+    third_column.append("✅" if assignment.get("grading_type") == "points" else "🟥")
+    third_column.append("✅" if assignment.get("points_possible") == 100 else "🟥")
+    third_column.append("✅" if int(module_info['weight']) == 20 else "🟥")
+    third_column.append("✅" if clean_string(module_info["name"]) == clean_string(assignment.get("name")) else "🟥")
+    third_column.append("✅" if assignment.get("discussion_type") == "threaded" else "🟥")
 
+    return {
+        "Tiene rubrica": rubric_details["name"] if third_column[0] == "✅" else "NO TIENE (Requiere configuracion manual)",
+        "Puntos rubrica": str(int(rubric_details["rubric_points"]) if rubric_details["has_rubric"] else "NO TIENE (Requiere configuracion manual)"),
+        "Usa rubrica para calificar": "SI" if third_column[2] == "✅" else "NO",
+        "Tipo de entrega": "En linea" if third_column[3] == "✅" else "Otro",
+        "Intentos permitidos": "Ilimitado" if assignment.get("allowed_attempts") == -1 else str(assignment.get("allowed_attempts")),
+        "Tipo de calificacion": "Puntos" if  third_column[5] == "✅" else "Otro",
+        "Puntos posibles": str(int(assignment.get("points_possible"))),
+        "Ponderacion": str(f"{int(module_info['weight'])}%"),
+        "Modulo": str(module_info["name"]),
+        "Desactivar respuestas hilvadanas": "SI" if third_column[9] == "✅" else "NO"
+    }, third_column
+ 
+def analyze_assignment_finalwork(course_id, assignment):
+    """Analiza la tarea aplicando varios criterios y retorna los detalles."""
+    rubric_details = get_rubric_details(course_id, assignment)
+    module_info = get_module_name(course_id, assignment.get("assignment_group_id"))
+    
+    third_column = []
+    third_column.append("✅" if rubric_details["has_rubric"] else "🟥")
+    third_column.append("✅" if rubric_details["rubric_points"] == 100 else "🟥")
+    third_column.append("✅" if rubric_details["rubric_used_for_grading"] else "🟥")
+    third_column.append("✅" if assignment.get("submission_types") == ["online_upload"] else "🟥")
+    third_column.append("✅" if assignment.get("allowed_attempts") == 2 else "🟥")
+    third_column.append("✅" if assignment.get("grading_type") == "points" else "🟥")
+    third_column.append("✅" if assignment.get("points_possible") == 100 else "🟥")
+    third_column.append("✅" if int(module_info['weight']) == 50 else "🟥")
+    third_column.append("✅" if clean_string(module_info["name"]) == clean_string(assignment.get("name")) else "🟥")
+    third_column.append("✅" if assignment.get("group_category_id") is None else "🟥")
+
+    return {
+        "Tiene rubrica": rubric_details["name"] if third_column[0] == "✅" else "NO TIENE (Requiere configuracion manual)",
+        "Puntos rubrica": str(int(rubric_details["rubric_points"]) if rubric_details["has_rubric"] else "NO TIENE (Requiere configuracion manual)"),
+        "Usa rubrica para calificar": "SI" if third_column[2] == "✅" else "NO",
+        "Tipo de entrega": "En linea" if third_column[3] == "✅" else "Otro",
+        "Intentos permitidos": str(assignment.get("allowed_attempts")),
+        "Tipo de calificacion": "Puntos" if  third_column[5] == "✅" else "Otro",
+        "Puntos posibles": str(int(assignment.get("points_possible"))),
+        "Ponderacion": str(f"{int(module_info['weight'])}%"),
+        "Modulo": str(module_info["name"]),
+        "Es trabajo en grupo": "NO" if third_column[9] == "✅" else "SI",
+    }, third_column
+    
 def display_details_as_table(details, estado):
     """Muestra los detalles en forma de tabla usando pandas."""
     data = {"Requerimiento": list(details.keys()), "Actual": list(details.values()), "Estado":estado}
@@ -355,7 +425,7 @@ def correct_teamwork_assignment(course_id):
 
     if teamwork_assignment.get("points_possible") != 100:
         payload_assignment["points_possible"] = 100
-
+    
     # Correcciones en el módulo (assignment group)
     if correct_module and correct_module.get("name") != teamwork_assignment.get("name"):
         payload_modules["name"] = teamwork_assignment.get("name")
@@ -416,23 +486,48 @@ def main():
     accion = st.radio("Seleccione una acción:", ("Revisar", "Corregir"))
     
     if st.button("Ejecutar"):
+        st.divider()
         course_ids = parse_course_ids(input_ids)
         if not course_ids:
             st.warning("No hay IDs de curso válidos.")
         else:
             for course_id in course_ids:
-                st.subheader(f"Course ID: {course_id}")
+                course_info = canvas_request('get', f"/courses/{course_id}")
+                is_massive = False
+                st.markdown(f"##### [{course_info.get('name')} - ({course_info.get('id')}) - {course_info.get('course_code')}](https://canvas.uautonoma.cl/courses/{course_id}/assignments)", unsafe_allow_html=True)
                 if accion == "Revisar":
                     assignments = get_assignments(course_id)
-                    teamwork_assignments = [a for a in assignments if "trabajo en equipo" in a["name"].lower()]
+                    forum_assignments = [a for a in assignments if "foro academico" in clean_string(a["name"].lower())]
+                    teamwork_assignments = [a for a in assignments if "trabajo en equipo" in clean_string(a["name"].lower())]
+                    final_assignments = [a for a in assignments if "trabajo final" in clean_string(a["name"].lower())]
+                    #comprobando foro academico
+                    if not forum_assignments:
+                        st.info(f"No hay tareas llamadas 'Foro academico' en el curso {course_id}.")
+                        # continue
+                    else:
+                        for assignment in forum_assignments:
+                            st.write(f"##### Tarea: {assignment['name']}")
+                            details, third_column = analyze_assignment_forum(course_id, assignment)
+                            display_details_as_table(details, third_column)
+                    #comprobando trabajo en equipo
                     if not teamwork_assignments:
                         st.info(f"No hay tareas llamadas 'Trabajo en equipo' en el curso {course_id}.")
-                        continue
-                    for assignment in teamwork_assignments:
-                        st.write(f"### Tarea: {assignment['name']}")
-                        details, third_column = analyze_assignment(course_id, assignment)
-                        display_details_as_table(details, third_column)
-                        st.divider()
+                    else:
+                        # continue
+                        for assignment in teamwork_assignments:
+                            st.write(f"##### Tarea: {assignment['name']}")
+                            details, third_column = analyze_assignment_teamwork(course_id, assignment)
+                            display_details_as_table(details, third_column)
+                    #comprobando trabajo final
+                    if not final_assignments:
+                        st.info(f"No hay tareas llamadas 'Trabajo final' en el curso {course_id}.")
+                    else:
+                        # continue
+                        for assignment in final_assignments:
+                            st.markdown(f"##### Tarea: {assignment['name']}")
+                            details, third_column = analyze_assignment_finalwork(course_id, assignment)
+                            display_details_as_table(details, third_column)
+                            st.divider()
                 else:  # acción "Corregir"
                     correct_teamwork_assignment(course_id)
 
